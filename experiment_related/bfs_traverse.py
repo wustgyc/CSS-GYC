@@ -32,11 +32,10 @@ CACHE_STORE_PATH = "/NewDisk/gyc/CSS-CACHE/experiment_related/cache_store_space"
 Ihd = 2
 cache_use = True
 random.seed(0)
-auth_token = "AUTH_tk1f087a802596473fa5a249f4c65aaab3"
+auth_token = "AUTH_tk285c229746c641a888797aa8ed307829"
 neo4j_uri = "bolt://127.0.0.1:7687"
-download_process_num = 4  # 不能再大了，再大负载受不了
+download_process_num = 8  # 不能再大了，再大负载受不了
 download_thread_num = 16
-
 
 def cache_ejected_callback(key, value):
     try:
@@ -85,7 +84,6 @@ def traverse_SHG(hash, radius):
             cypher_cmd = "match(n:IHashNode {hashCode:'" + hash + "'}) call algo.bfs.stream('IHashNode', 'Simi', 'OUTGOING', id(n),{maxCost:" + str(
                 radius + 1) + ", weightProperty:'dist'}) yield nodeIds unwind nodeIds as nodeId return algo.asNode(nodeId).file_list,algo.asNode(nodeId).hashCode"  # BFS的时候第一个结点会占1个dist，所以args.dist_thre+1
 
-            print(cypher_cmd)
             try:
                 ret = session.run(cypher_cmd)
             except Exception as e:
@@ -98,7 +96,7 @@ def traverse_SHG(hash, radius):
         SimiNodes_filename_str.append(str_record_0)  # ['a;b;c;','d;g;','x;y;z;']
         SimiNodes_hash_str.append(str_record_1)
 
-    print('SHG:', len(str_to_list(array_join(SimiNodes_filename_str))))
+    print("SHG:",len(str_to_list(array_join(SimiNodes_filename_str))))
     return SimiNodes_filename_str, SimiNodes_hash_str
 
 
@@ -131,6 +129,7 @@ def download_thread(job, mod):
 
 
 def download_from_swift(curr_name, shg_distance_item, mod):
+
     if mod == "write":
         os.system("mkdir -p " + os.path.join(CACHE_STORE_PATH, curr_name))
     download_job_list = []
@@ -204,6 +203,7 @@ def analyse_query(curr_name, curr_hash, semi_radius=8):
     logger.debug("analyse_query:" + " " + curr_name + " " + curr_hash + " " + str(semi_radius))
     global point
     if curr_name in cache.table:
+        print("point")
         assert curr_hash == cache[curr_name][0]
 
         # 如果要写入子进程则需声明共享变量
@@ -219,12 +219,12 @@ def analyse_query(curr_name, curr_hash, semi_radius=8):
 
         if curr_name not in str_to_list(array_join(shg_file_name_2d)):   #哈希给对了，但是文件名瞎几把输的清空
             return []
-        # use img_list to do something
 
         # check
         shg_distance_item = sort_relevant_to_array(shg_file_name_2d, shg_hash_1d, curr_hash)
         need_to_add_item = check_cache(cache_distance_item, shg_distance_item, semi_radius)
         img_list.extend(download_from_swift(curr_name, need_to_add_item, "add"))  # add something to cache
+        # use img_list to do something
 
         # update_cache 无论如何以新的为准
         cache[curr_name][0] = curr_hash
@@ -282,7 +282,6 @@ def insert(curr_name, curr_hash):        #改！！！！！！！ 判断match
                     for i, si_node in enumerate(Simi_node):
                         si_hash = si_node[0]
                         si_dist = si_node[1]
-                        print(si_dist)
                         # 加入正向边
                         cypher_cmd = "match (begin:IHashNode{hashCode:'" + curr_hash + "'}) match (end:IHashNode{hashCode:'" + si_hash + "'}) merge (begin)-[r:Simi{dist:" + str(
                             si_dist) + "}]->(end)"
@@ -483,6 +482,23 @@ def delete_fun(job_list_name,job_list_hash):
     return 0
 
 
+def traverse_SHG_process(sub_hashcode,radius,lock):
+    thread_pool=ThreadPoolExecutor(1)
+    thread_job_ret=[]
+    time_list=[]
+    for row in sub_hashcode:
+        thread_job_ret.append(thread_pool.submit(traverse_SHG(row,radius)))
+
+    for ret in as_completed(thread_job_ret):
+        time_list.append(ret.result())
+    with lock:
+        with open("mean_file_num.csv",'a') as f:
+            csv_writer=csv.writer(f)
+            for row in time_list:
+                csv_writer.writerow(row)
+            f.flush()
+
+
 if __name__ == "__main__":
     # parse parameter
     parser = argparse.ArgumentParser(description='manual to this script')
@@ -506,7 +522,7 @@ if __name__ == "__main__":
     if os.path.exists('cache.npy'):
         cache.table = np.load('cache.npy').item()
 
-    # init dataset
+    # init dataset(也可以从tmp读取上一次的新增集和原始集)
     with h5py.File(os.path.join(__PATH2__, 'ImageNet_1million_png_predicthashstr_train.hdf5'), 'r') as f:
         hashcode = f['predicthashstr'].value
         hashcode = hashcode.astype(np.str)
@@ -539,38 +555,32 @@ if __name__ == "__main__":
         mem_use_avg.append([])
         query_times_list.append(i * args.max_query_times // overload_divide)
 
-    # init neo4j
-
-
     # init process_pool
     consistency_process_pool = ProcessPoolExecutor(max_workers=2)  # shg与swift并行的进程池
     download_process_pool = ProcessPoolExecutor(max_workers=download_process_num)  # 下载专用进程池
 
-    begin = datetime.datetime.now()
-    # for i,row in enumerate(hashcode_new):
-    #     cmd="match (n:IHashNode{hashCode:'"+row+"'}) return count(n)"
-    #     with GraphDatabase.driver(neo4j_uri, auth=basic_auth("neo4j", "123456")) as c_driver:
-    #         with c_driver.session() as session:
-    #             shg_ret=session.run(cmd)
-    #         for row in shg_ret:
-    #             exist=row[0]
-    #         if exist==0:
-    #             print(hashcode_new[i],name_path_list_new[i],i)
-    #             exit(0)
+    total_time_miss=0
+    #实验部分开始
+    for i in range(10):
+        begin_time=datetime.datetime.now()
+        analyse_query(name_path_list[i],hashcode[i],semi_radius=2)
+        end_time=datetime.datetime.now()
+        total_time_miss+=(end_time-begin_time).total_seconds()
+        print(i,"miss time:",(end_time-begin_time).total_seconds())
+        print()
 
+    total_time_point = 0
+    for i in range(10):
+        begin_time=datetime.datetime.now()
+        analyse_query(name_path_list[i],hashcode[i],semi_radius=2)
+        end_time=datetime.datetime.now()
+        total_time_point+=(end_time-begin_time).total_seconds()
+        print(i,"poing time:",(end_time-begin_time).total_seconds())
+        print()
 
-    # print(name_path_list_new[0],hashcode_new[0])
-    insert(name_path_list_new[2], hashcode_new[2])
-    delete(name_path_list_new[2], hashcode_new[2])
-    
-    end = datetime.datetime.now()
-    print("cost time:",(end-begin).total_seconds())
-    # 开始计时
-    # insert(name_path_list_new[0], hashcode_new[0])
-    # begin=datetime.datetime.now()
-    # analyse_query(name_path_list[0],hashcode[0])
-    # end = datetime.datetime.now()
-    # print("cost time:",(end-begin).total_seconds())
+    print("total_time_miss:",total_time_miss)
+    print("total_time_point:", total_time_point)
+    #实验部分结束
 
 
 
@@ -624,10 +634,10 @@ if __name__ == "__main__":
     # 持久化cache
     np.save('cache.npy', cache.table)
 
-    np.save('../data/hashcode.npy',hashcode)
-    np.save('../data/hashcode_new.npy', hashcode_new)
-    np.save('../data/name_path_list', name_path_list)
-    np.save('../data/name_path_list_new', name_path_list_new)
+    np.save('./tmp/hashcode.npy', hashcode)                        #tmp里保存的东西应该与SHG与swift一致
+    np.save('./tmp/hashcode_new.npy', hashcode_new)
+    np.save('./tmp/name_path_list.npy', name_path_list)
+    np.save('./tmp/name_path_list_new.npy', name_path_list_new)
     # 退出
     download_process_pool.shutdown(wait=True)
     consistency_process_pool.shutdown(wait=True)
